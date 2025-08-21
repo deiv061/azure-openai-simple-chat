@@ -3,7 +3,7 @@
 # This script sets up GitHub Actions CI/CD pipeline for the Azure Chat App
 # Run these commands manually in your terminal after installing git and gh CLI
 
-$subscriptionId = "8f7a9e97-c8d9-45ab-a812-2e17388dd1c6"
+$subscriptionId = ""
 
 Write-Host "🚀 Setting up GitHub Actions CI/CD for Azure Chat App" -ForegroundColor Green
 Write-Host ""
