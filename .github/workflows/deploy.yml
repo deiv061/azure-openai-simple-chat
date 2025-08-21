@@ -1,0 +1,157 @@
+name: Deploy Azure Chat App
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  AZURE_LOCATION: eastus
+  RESOURCE_GROUP_PREFIX: rg-chatapp
+  ACR_NAME_PREFIX: acrchatapp
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: dev
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Azure Login with OIDC
+      uses: azure/login@v1
+      with:
+        client-id: ${{ secrets.AZURE_CLIENT_ID }}
+        tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+        subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: 1.5.0
+        terraform_wrapper: false
+
+    - name: Terraform Init
+      run: |
+        cd infrastructure
+        terraform init
+
+    - name: Terraform Plan
+      run: |
+        cd infrastructure
+        terraform plan -out=tfplan
+
+    - name: Deploy Infrastructure
+      run: |
+        cd infrastructure
+        terraform apply -auto-approve tfplan
+        
+        # Export outputs for later steps
+        echo "RESOURCE_GROUP_NAME=$(terraform output -raw resource_group_name)" >> $GITHUB_ENV
+        echo "ACR_LOGIN_SERVER=$(terraform output -raw acr_login_server)" >> $GITHUB_ENV
+        echo "AKS_CLUSTER_NAME=$(terraform output -raw aks_cluster_name)" >> $GITHUB_ENV
+        echo "OPENAI_ENDPOINT=$(terraform output -raw openai_endpoint)" >> $GITHUB_ENV
+        echo "REDIS_HOSTNAME=$(terraform output -raw redis_hostname)" >> $GITHUB_ENV
+
+    - name: Get ACR Name
+      run: |
+        ACR_NAME=$(echo ${{ env.ACR_LOGIN_SERVER }} | cut -d'.' -f1)
+        echo "ACR_NAME=$ACR_NAME" >> $GITHUB_ENV
+
+    - name: Azure Container Registry Login
+      run: |
+        az acr login --name ${{ env.ACR_NAME }}
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Build and Push Chat Service Image
+      run: |
+        cd backend/chat-service
+        docker build -t ${{ env.ACR_LOGIN_SERVER }}/chat-service:${{ github.sha }} .
+        docker build -t ${{ env.ACR_LOGIN_SERVER }}/chat-service:latest .
+        docker push ${{ env.ACR_LOGIN_SERVER }}/chat-service:${{ github.sha }}
+        docker push ${{ env.ACR_LOGIN_SERVER }}/chat-service:latest
+
+    - name: Build and Push Session Service Image
+      run: |
+        cd backend/session-service
+        docker build -t ${{ env.ACR_LOGIN_SERVER }}/session-service:${{ github.sha }} .
+        docker build -t ${{ env.ACR_LOGIN_SERVER }}/session-service:latest .
+        docker push ${{ env.ACR_LOGIN_SERVER }}/session-service:${{ github.sha }}
+        docker push ${{ env.ACR_LOGIN_SERVER }}/session-service:latest
+
+    - name: Build and Push Frontend Image
+      run: |
+        cd frontend
+        docker build -t ${{ env.ACR_LOGIN_SERVER }}/frontend:${{ github.sha }} .
+        docker build -t ${{ env.ACR_LOGIN_SERVER }}/frontend:latest .
+        docker push ${{ env.ACR_LOGIN_SERVER }}/frontend:${{ github.sha }}
+        docker push ${{ env.ACR_LOGIN_SERVER }}/frontend:latest
+
+    - name: Get AKS Credentials
+      run: |
+        az aks get-credentials --resource-group ${{ env.RESOURCE_GROUP_NAME }} --name ${{ env.AKS_CLUSTER_NAME }} --overwrite-existing
+
+    - name: Update Kubernetes Manifests
+      run: |
+        # Update image references in k8s manifests
+        sed -i "s|acrchatapp\.azurecr\.io|${{ env.ACR_LOGIN_SERVER }}|g" k8s/*.yaml
+        sed -i "s|:latest|:${{ github.sha }}|g" k8s/*.yaml
+
+    - name: Get Azure Resource Secrets
+      run: |
+        cd infrastructure
+        OPENAI_KEY=$(terraform output -raw openai_key)
+        REDIS_KEY=$(terraform output -raw redis_primary_access_key)
+        
+        echo "OPENAI_KEY=$OPENAI_KEY" >> $GITHUB_ENV
+        echo "REDIS_KEY=$REDIS_KEY" >> $GITHUB_ENV
+
+    - name: Deploy to AKS
+      run: |
+        # Create namespace
+        kubectl create namespace azure-chat-app --dry-run=client -o yaml | kubectl apply -f -
+        
+        # Delete existing secrets if they exist
+        kubectl delete secret app-secrets -n azure-chat-app --ignore-not-found=true
+        
+        # Create secrets
+        kubectl create secret generic app-secrets -n azure-chat-app \
+          --from-literal=OPENAI_ENDPOINT="${{ env.OPENAI_ENDPOINT }}" \
+          --from-literal=OPENAI_API_KEY="${{ env.OPENAI_KEY }}" \
+          --from-literal=REDIS_HOST="${{ env.REDIS_HOSTNAME }}" \
+          --from-literal=REDIS_PASSWORD="${{ env.REDIS_KEY }}" \
+          --from-literal=REDIS_PORT="6380" \
+          --from-literal=REDIS_SSL="true"
+        
+        # Apply manifests
+        kubectl apply -f k8s/
+        
+        # Wait for deployments
+        kubectl wait --for=condition=available --timeout=300s deployment/chat-service -n azure-chat-app
+        kubectl wait --for=condition=available --timeout=300s deployment/session-service -n azure-chat-app
+        kubectl wait --for=condition=available --timeout=300s deployment/frontend -n azure-chat-app
+
+    - name: Get Application URL
+      run: |
+        echo "Waiting for LoadBalancer IP assignment..."
+        sleep 60
+        FRONTEND_IP=$(kubectl get svc frontend -n azure-chat-app -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "")
+        
+        if [ -n "$FRONTEND_IP" ]; then
+          echo "✅ Application deployed successfully!"
+          echo "🌐 Frontend URL: http://$FRONTEND_IP:3000"
+        else
+          echo "⚠️ LoadBalancer IP not yet assigned. Check with: kubectl get svc frontend -n azure-chat-app"
+        fi
+        
+        # Display deployment info
+        echo "📋 Deployment Summary:"
+        kubectl get all -n azure-chat-app

@@ -1,0 +1,83 @@
+name: Destroy Infrastructure
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_destroy:
+        description: 'Type "destroy" to confirm'
+        required: true
+        default: ''
+
+env:
+  AZURE_LOCATION: eastus
+
+jobs:
+  destroy:
+    runs-on: ubuntu-latest
+    environment: dev
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+    - name: Validate Confirmation
+      run: |
+        if [ "${{ github.event.inputs.confirm_destroy }}" != "destroy" ]; then
+          echo "❌ Confirmation failed. You must type 'destroy' to proceed."
+          exit 1
+        fi
+        echo "✅ Confirmation validated. Proceeding with destruction."
+
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Azure Login with OIDC
+      uses: azure/login@v1
+      with:
+        client-id: ${{ secrets.AZURE_CLIENT_ID }}
+        tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+        subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: 1.5.0
+        terraform_wrapper: false
+
+    - name: Terraform Init
+      run: |
+        cd infrastructure
+        terraform init
+
+    - name: Get Resource Names
+      run: |
+        cd infrastructure
+        if [ -f terraform.tfstate ]; then
+          echo "RESOURCE_GROUP_NAME=$(terraform output -raw resource_group_name 2>/dev/null || echo '')" >> $GITHUB_ENV
+          echo "AKS_CLUSTER_NAME=$(terraform output -raw aks_cluster_name 2>/dev/null || echo '')" >> $GITHUB_ENV
+        fi
+
+    - name: Delete Kubernetes Resources
+      run: |
+        if [ -n "${{ env.RESOURCE_GROUP_NAME }}" ] && [ -n "${{ env.AKS_CLUSTER_NAME }}" ]; then
+          echo "Deleting Kubernetes resources..."
+          az aks get-credentials --resource-group ${{ env.RESOURCE_GROUP_NAME }} --name ${{ env.AKS_CLUSTER_NAME }} --overwrite-existing || true
+          kubectl delete namespace azure-chat-app --ignore-not-found=true || true
+        fi
+
+    - name: Terraform Destroy
+      run: |
+        cd infrastructure
+        terraform destroy -auto-approve
+
+    - name: Cleanup Summary
+      run: |
+        echo "🗑️ Infrastructure destruction completed!"
+        echo "All Azure resources have been deleted."
+        echo ""
+        echo "📋 What was destroyed:"
+        echo "- Azure Kubernetes Service cluster"
+        echo "- Azure Container Registry"
+        echo "- Azure OpenAI service"
+        echo "- Azure Cache for Redis"
+        echo "- Resource Group and all contained resources"

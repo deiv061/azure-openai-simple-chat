@@ -1,0 +1,71 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chat-service
+  namespace: azure-chat-app
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: chat-service
+  template:
+    metadata:
+      labels:
+        app: chat-service
+    spec:
+      containers:
+      - name: chat-service
+        image: acrchatapp6fantofg.azurecr.io/chat-service:latest
+        ports:
+        - containerPort: 8000
+        env:
+        - name: OPENAI_ENDPOINT
+          valueFrom:
+            secretKeyRef:
+              name: app-secrets
+              key: OPENAI_ENDPOINT
+        - name: OPENAI_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: app-secrets
+              key: OPENAI_API_KEY
+        - name: OPENAI_DEPLOYMENT
+          value: "gpt-4o-mini"
+        - name: SESSION_SERVICE_URL
+          valueFrom:
+            configMapKeyRef:
+              name: app-config
+              key: SESSION_SERVICE_URL
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: chat-service
+  namespace: azure-chat-app
+spec:
+  selector:
+    app: chat-service
+  ports:
+  - protocol: TCP
+    port: 8000
+    targetPort: 8000
+  type: ClusterIP
