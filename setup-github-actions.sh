@@ -2,7 +2,7 @@
 
 # GitHub Actions Setup Script for Azure Chat App (Bash version)
 
-SUBSCRIPTION_ID="8f7a9e97-c8d9-45ab-a812-2e17388dd1c6"
+SUBSCRIPTION_ID=""
 
 echo "🚀 Setting up GitHub Actions CI/CD for Azure Chat App"
 echo ""
